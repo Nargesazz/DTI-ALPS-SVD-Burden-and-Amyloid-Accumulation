@@ -1,0 +1,111 @@
+#for binary outcomes:
+import warnings
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import statsmodels.formula.api as smf
+import matplotlib.pyplot as plt
+from scipy.stats import zscore
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+# File paths and columns setup
+FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx"
+ID_COL = "Subject"
+SESSION_COL = "Session"
+DATE_COL = "NP_SessionDate"
+BASELINE_SESSION = 1
+FOLLOWUP_SESSION = 4
+
+# Binary outcomes (Key binary variables)
+BINARY_OUTCOMES = [
+    "Radiologist_PVS_MidBrain",
+    "Lacune_Presence",
+    "Radiologist_MARS_Infratentorial",
+    "Radiologist_MARS_Deep",
+    "Radiologist_MARS_Lobar",
+    "Radiologist_BOMBS_Lobar",
+    "Radiologist_BOMBS_BG",
+    "Radiologist_BOMBS_Posterior_Fossa"
+]
+
+# Covariates
+COVARS = ["Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
+
+# Output directory
+OUTDIR = Path(FILE_PATH).parent / "PY_STRICT_ALPS_Binary"
+OUTDIR.mkdir(parents=True, exist_ok=True)
+
+# Read data from the file
+df = pd.read_excel(FILE_PATH)
+
+# Check if all necessary columns exist
+print("Columns in dataset:", df.columns)
+
+# Preprocess: Ensure baseline covariates (Age, Gender, Education)
+df["Age_baseline"] = df["Age"]
+df["Gender_baseline"] = df["Gender"]
+df["YrsOfEd_baseline"] = df["YrsOfEd"]
+
+# Create a 'TimeYears' column based on the session date
+df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors='coerce')
+base_date = df[df[SESSION_COL] == BASELINE_SESSION].groupby(ID_COL)[DATE_COL].min()
+df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
+df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
+
+# Fix: If ALPS baseline is missing, replace it with the z-score of ALPS
+df['ALPS_baseline_z'] = zscore(df['alps'], nan_policy='omit')
+
+# Prepare outcome models
+rows = []  # Store results
+skipped = []  # Store skipped models
+
+# Loop through the binary outcomes
+for outcome in BINARY_OUTCOMES:
+    print(f"=======================================")
+    print(f"Fitting outcome: {outcome}")
+    
+    if outcome not in df.columns:
+        skipped.append({"outcome": outcome, "reason": "missing column"})
+        continue
+    
+    d = df[[ID_COL, SESSION_COL, "TimeYears", outcome, "ALPS_baseline_z", "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
+    
+    # Ensure the outcome is numeric
+    d[outcome] = pd.to_numeric(d[outcome], errors='coerce')
+
+    # Model-wise complete case (dropping rows with missing values in any of the necessary columns)
+    required_cols = [ID_COL, SESSION_COL, "TimeYears", outcome, "ALPS_baseline_z", "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
+    d = d.dropna(subset=required_cols)
+
+    # Fit the logistic regression model for binary outcomes
+    try:
+        formula = f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + Age_baseline + C(Gender_baseline) + YrsOfEd_baseline"
+        model = smf.logit(formula, data=d)
+        fit = model.fit()
+
+        # Save the results for the key terms
+        for term in ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]:
+            rows.append({
+                "outcome": outcome,
+                "term": term,
+                "beta": fit.params.get(term, np.nan),
+                "se": fit.bse.get(term, np.nan),
+                "p": fit.pvalues.get(term, np.nan),
+                "n_rows": len(d),
+                "n_subjects": d[ID_COL].nunique()
+            })
+        
+    except Exception as e:
+        skipped.append({"outcome": outcome, "reason": f"fit failed: {type(e).__name__}"})
+
+# Save results to Excel
+res_df = pd.DataFrame(rows)
+skipped_df = pd.DataFrame(skipped)
+res_df.to_excel(OUTDIR / "LMM_Binary_FDR_Results.xlsx", index=False)
+skipped_df.to_excel(OUTDIR / "Skipped_Binary_Outcomes.xlsx", index=False)
+
+print("Results saved to:", OUTDIR / "LMM_Binary_FDR_Results.xlsx")
+print("Skipped outcomes saved to:", OUTDIR / "Skipped_Binary_Outcomes.xlsx")
+
