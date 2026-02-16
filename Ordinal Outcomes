@@ -1,0 +1,441 @@
+# ============================================================
+# STRICT ALPS → ORDINAL OUTCOMES (HABS-like)
+# Sessions: 1 baseline, 4 follow-up (~3y)
+# TimeYears: from NP_SessionDate (years since baseline per Subject)
+# Model: cumulative ordinal mixed model with random intercept (Subject)
+# Outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+#
+# Missing handling: model-wise complete-case (NO global drops)
+# Sparse categories: collapse rare levels (pre-specified min count)
+# Evidence: posterior mean + 95% HDI + P(beta>0) + two-sided p~
+# Optional managed BH-FDR: within Ordinal family per primary term
+# Figures: paired stacked proportions (Session1 vs Session4)
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+import bambi as bmb
+import arviz as az
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx"   # <-- edit
+
+ID_COL = "Subject"
+SESSION_COL = "Session"
+DATE_COL = "NP_SessionDate"
+ALPS_COL = "alps"
+
+BASELINE_SESSION = 1
+FOLLOWUP_SESSION = 4
+
+# Ordinal outcomes
+ORDINAL_OUTCOMES = [
+    "Fazekas_Total",
+    "ARWMC_Total",
+    "Radiologist_PVS_BG",
+    "Radiologist_PVS_CentrumSemiovale",
+    "Radiologist_PVS_MidBrain",
+    "Radiologist_MARS_Infratentorial",
+    "Radiologist_MARS_Deep",
+    "Radiologist_MARS_Lobar",
+    "Radiologist_BOMBS_Lobar",
+    "Radiologist_BOMBS_BG",
+    "Radiologist_BOMBS_Posterior_Fossa",
+    # If Lacune_Presence is binary, keep it OUT of ordinal and model separately
+]
+
+# Baseline covariates
+COVARS = ["Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
+
+# Sparse category collapsing
+MIN_LEVEL_COUNT = 10   # pre-specified: levels with <10 observations are collapsed
+
+# Primary terms for reporting / managed FDR
+PRIMARY_TERMS = ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]
+
+# MCMC settings (paper-safe defaults)
+DRAWS = 2000
+TUNE = 2000
+CHAINS = 4
+CORES = 4
+TARGET_ACCEPT = 0.93
+RANDOM_SEED = 42
+
+# Output
+OUTDIR = Path(FILE_PATH).parent / "PY_STRICT_ALPS_ORDINAL"
+FIGDIR = OUTDIR / "figures"
+OUTDIR.mkdir(parents=True, exist_ok=True)
+FIGDIR.mkdir(parents=True, exist_ok=True)
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def safe_numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def parse_excel_date(x):
+    if pd.api.types.is_datetime64_any_dtype(x):
+        return pd.to_datetime(x, errors="coerce")
+    if pd.api.types.is_numeric_dtype(x):
+        return pd.to_datetime("1899-12-30") + pd.to_timedelta(x, unit="D")
+    return pd.to_datetime(x, errors="coerce")
+
+def zscore(series: pd.Series) -> pd.Series:
+    m = series.mean(skipna=True)
+    sd = series.std(ddof=0, skipna=True)
+    if sd == 0 or np.isnan(sd):
+        return series * np.nan
+    return (series - m) / sd
+
+def bh_fdr(pvals):
+    p = np.asarray(pvals, float)
+    q = np.full_like(p, np.nan)
+    m = np.isfinite(p).sum()
+    if m == 0:
+        return q
+    order = np.argsort(p)
+    ranked = p[order]
+    qvals = ranked * m / (np.arange(1, m + 1))
+    qvals = np.minimum.accumulate(qvals[::-1])[::-1]
+    q[order] = qvals
+    return np.clip(q, 0, 1)
+
+def collapse_sparse_levels(y: pd.Series, min_count=10):
+    """
+    Collapse sparse ordinal levels into nearest neighbor levels.
+    Strategy (strict, deterministic):
+      - compute counts by level
+      - while any level has count < min_count:
+          merge the smallest-count level into the closest adjacent level (by numeric distance)
+    """
+    yy = safe_numeric(y).dropna()
+    if yy.nunique() < 3:
+        return y  # do not touch binary/2-level here
+
+    # work on numeric levels
+    levels = sorted(yy.unique().tolist())
+    counts = yy.value_counts().to_dict()
+
+    # helper: closest neighbor
+    def closest_neighbor(level, levels):
+        idx = levels.index(level)
+        if idx == 0:
+            return levels[1]
+        if idx == len(levels) - 1:
+            return levels[-2]
+        # choose adjacent with higher count (more stable); if tie, choose lower distance (equal)
+        left = levels[idx - 1]
+        right = levels[idx + 1]
+        return left if counts.get(left, 0) >= counts.get(right, 0) else right
+
+    # iterative merging
+    levels_work = levels[:]
+    counts_work = counts.copy()
+
+    changed = True
+    while changed:
+        changed = False
+        # find sparse levels
+        sparse = [lv for lv in levels_work if counts_work.get(lv, 0) < min_count]
+        if not sparse:
+            break
+
+        # merge the sparsest first
+        lv = sorted(sparse, key=lambda z: counts_work.get(z, 0))[0]
+        nb = closest_neighbor(lv, levels_work)
+
+        # apply merge in data
+        y = y.replace({lv: nb})
+
+        # update counts
+        counts_work[nb] = counts_work.get(nb, 0) + counts_work.get(lv, 0)
+        counts_work[lv] = 0
+
+        # remove level
+        levels_work = [x for x in levels_work if x != lv]
+        changed = True
+
+        # stop if too few categories remain
+        if len(levels_work) < 3:
+            break
+
+    return y
+
+def to_ordered_cat(series: pd.Series) -> pd.Categorical:
+    vals = sorted([v for v in series.dropna().unique()])
+    return pd.Categorical(series, categories=vals, ordered=True)
+
+def draw_vector(idata, term):
+    try:
+        arr = idata.posterior[term].values
+        return arr.reshape(-1)
+    except Exception:
+        return None
+
+def post_prob_positive(draws: np.ndarray) -> float:
+    return float(np.mean(draws > 0))
+
+def post_p_two_sided(draws: np.ndarray) -> float:
+    ppos = np.mean(draws > 0)
+    pneg = np.mean(draws < 0)
+    return float(2 * min(ppos, pneg))
+
+def paired_stacked_plot(df_long, outcome, out_png):
+    d = df_long[[ID_COL, SESSION_COL, outcome]].copy()
+    d[outcome] = safe_numeric(d[outcome])
+    d = d.dropna()
+
+    # paired only
+    wide = d.pivot_table(index=ID_COL, columns=SESSION_COL, values=outcome, aggfunc="first")
+    if (BASELINE_SESSION not in wide.columns) or (FOLLOWUP_SESSION not in wide.columns):
+        return
+    wide = wide.dropna(subset=[BASELINE_SESSION, FOLLOWUP_SESSION])
+    if wide.shape[0] < 15:
+        return
+
+    cats = sorted(pd.unique(pd.concat([wide[BASELINE_SESSION], wide[FOLLOWUP_SESSION]], ignore_index=True)).tolist())
+
+    def proportions(s):
+        vc = s.value_counts(dropna=False)
+        return np.array([vc.get(c, 0) for c in cats]) / len(s)
+
+    p0 = proportions(wide[BASELINE_SESSION])
+    p1 = proportions(wide[FOLLOWUP_SESSION])
+
+    x = np.array([0, 1])
+    labels = [f"Session {BASELINE_SESSION}", f"Session {FOLLOWUP_SESSION}"]
+
+    plt.figure(figsize=(7.4, 4.9))
+    bottom = np.zeros(2)
+    for i, c in enumerate(cats):
+        vals = np.array([p0[i], p1[i]])
+        plt.bar(x, vals, bottom=bottom, label=f"{c}")
+        bottom += vals
+
+    plt.xticks(x, labels)
+    plt.ylabel("Proportion (paired subjects)")
+    plt.title(f"{outcome}: distribution change (paired only)")
+    plt.legend(title="Category", frameon=False, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+
+# -----------------------------
+# LOAD & PREP (NO global drops)
+# -----------------------------
+df = pd.read_excel(FILE_PATH)
+
+df[SESSION_COL] = safe_numeric(df[SESSION_COL]).astype("Int64")
+df = df[df[SESSION_COL].isin([BASELINE_SESSION, FOLLOWUP_SESSION])].copy()
+df[ID_COL] = df[ID_COL].astype(str)
+
+df[DATE_COL] = parse_excel_date(df[DATE_COL])
+
+# baseline date per subject (prefer session 1)
+base_date = (
+    df[df[SESSION_COL] == BASELINE_SESSION]
+    .groupby(ID_COL)[DATE_COL].min()
+)
+fallback_base = df.groupby(ID_COL)[DATE_COL].min()
+base_date = base_date.combine_first(fallback_base)
+
+df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
+df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
+df["TimeYears"] = safe_numeric(df["TimeYears"])
+
+# baseline covariates
+if "Age" in df.columns:
+    age_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "Age"]]
+        .dropna().drop_duplicates(subset=[ID_COL])
+        .rename(columns={"Age": "Age_baseline"})
+    )
+    df = df.merge(age_base, on=ID_COL, how="left")
+else:
+    df["Age_baseline"] = np.nan
+
+if "YrsOfEd" in df.columns:
+    edu_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "YrsOfEd"]]
+        .dropna().drop_duplicates(subset=[ID_COL])
+        .rename(columns={"YrsOfEd": "YrsOfEd_baseline"})
+    )
+    df = df.merge(edu_base, on=ID_COL, how="left")
+else:
+    df["YrsOfEd_baseline"] = np.nan
+
+if "Gender" in df.columns:
+    gen_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "Gender"]]
+        .dropna().drop_duplicates(subset=[ID_COL])
+        .rename(columns={"Gender": "Gender_baseline"})
+    )
+    df = df.merge(gen_base, on=ID_COL, how="left")
+else:
+    df["Gender_baseline"] = np.nan
+
+df["Gender_baseline"] = df["Gender_baseline"].astype("category")
+
+# baseline ALPS z
+df[ALPS_COL] = safe_numeric(df[ALPS_COL])
+alps_base = (
+    df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, ALPS_COL]]
+    .dropna().drop_duplicates(subset=[ID_COL])
+    .rename(columns={ALPS_COL: "ALPS_baseline"})
+)
+df = df.merge(alps_base, on=ID_COL, how="left")
+df["ALPS_baseline_z"] = zscore(df["ALPS_baseline"])
+
+# group as category for bambi
+df[ID_COL] = df[ID_COL].astype("category")
+
+print("Loaded:", df.shape, "| Subjects:", df[ID_COL].nunique())
+
+
+# -----------------------------
+# FIT ORDINAL BAYESIAN MIXED MODELS
+# -----------------------------
+rows = []
+skipped = []
+
+for outcome in ORDINAL_OUTCOMES:
+    if outcome not in df.columns:
+        skipped.append({"outcome": outcome, "reason": "missing column"})
+        continue
+
+    d = df[[outcome, ID_COL, "TimeYears", "ALPS_baseline_z",
+            "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
+
+    # numeric ordinal values
+    d[outcome] = safe_numeric(d[outcome])
+
+    # collapse sparse levels (strict, pre-specified)
+    d[outcome] = collapse_sparse_levels(d[outcome], min_count=MIN_LEVEL_COUNT)
+
+    # model-wise complete-case
+    d = d.dropna()
+
+    n_sub = int(d[ID_COL].nunique())
+    n_rows = int(d.shape[0])
+
+    # must have >=3 ordered categories for ordinal (strict)
+    if d[outcome].nunique() < 3:
+        skipped.append({"outcome": outcome, "reason": "<3 categories after collapse/complete-case",
+                        "n_rows": n_rows, "n_subjects": n_sub})
+        continue
+
+    if n_sub < 15 or n_rows < 40:
+        skipped.append({"outcome": outcome, "reason": "too few rows/subjects after complete-case",
+                        "n_rows": n_rows, "n_subjects": n_sub})
+        continue
+
+    # ordered categorical response
+    d[outcome] = to_ordered_cat(d[outcome])
+
+    # formula: cumulative ordinal mixed, random intercept
+    formula = (
+        f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z "
+        f"+ Age_baseline + C(Gender_baseline) + YrsOfEd_baseline + (1|{ID_COL})"
+    )
+
+    print("=" * 45)
+    print("Fitting ordinal outcome:", outcome)
+    try:
+        model = bmb.Model(formula, d, family="cumulative")
+        idata = model.fit(
+            draws=DRAWS, tune=TUNE, chains=CHAINS, cores=CORES,
+            target_accept=TARGET_ACCEPT, random_seed=RANDOM_SEED
+        )
+    except Exception as e:
+        skipped.append({"outcome": outcome, "reason": f"fit failed: {type(e).__name__}",
+                        "n_rows": n_rows, "n_subjects": n_sub})
+        continue
+
+    # posterior summaries
+    summ = az.summary(idata, hdi_prob=0.95).reset_index().rename(columns={"index": "term"})
+    summ = summ[summ["term"].isin(PRIMARY_TERMS)].copy()
+
+    for term in PRIMARY_TERMS:
+        draws = draw_vector(idata, term)
+        if draws is None or len(draws) == 0:
+            rows.append({
+                "outcome": outcome,
+                "term": term,
+                "mean": np.nan,
+                "sd": np.nan,
+                "hdi_2.5%": np.nan,
+                "hdi_97.5%": np.nan,
+                "P(beta>0)": np.nan,
+                "post_p_two_sided": np.nan,
+                "n_rows": n_rows,
+                "n_subjects": n_sub,
+                "status": "TERM_NOT_FOUND"
+            })
+            continue
+
+        if term in summ["term"].values:
+            r = summ[summ["term"] == term].iloc[0]
+            mean = float(r["mean"])
+            sd = float(r["sd"])
+            hdi_lo = float(r["hdi_2.5%"])
+            hdi_hi = float(r["hdi_97.5%"])
+        else:
+            mean = float(np.mean(draws))
+            sd = float(np.std(draws, ddof=0))
+            hdi_lo, hdi_hi = np.quantile(draws, [0.025, 0.975])
+
+        rows.append({
+            "outcome": outcome,
+            "term": term,
+            "mean": mean,
+            "sd": sd,
+            "hdi_2.5%": hdi_lo,
+            "hdi_97.5%": hdi_hi,
+            "P(beta>0)": post_prob_positive(draws),
+            "post_p_two_sided": post_p_two_sided(draws),
+            "n_rows": n_rows,
+            "n_subjects": n_sub,
+            "status": "OK"
+        })
+
+    # paired distribution plot (descriptive)
+    try:
+        paired_stacked_plot(df, outcome, FIGDIR / f"ORD_DIST_{outcome}.png")
+    except Exception:
+        pass
+
+
+res = pd.DataFrame(rows)
+skip_df = pd.DataFrame(skipped)
+
+# -----------------------------
+# OPTIONAL: Managed BH-FDR for ordinal (within Ordinal family per term)
+# Use posterior p-analogue as p-values for multiplicity control (transparent).
+# -----------------------------
+res["q_FDR"] = np.nan
+for term in PRIMARY_TERMS:
+    idx = (res["term"] == term) & (res["status"] == "OK")
+    res.loc[idx, "q_FDR"] = bh_fdr(res.loc[idx, "post_p_two_sided"].values)
+
+res["signif_q_lt_0p05"] = res["q_FDR"] < 0.05
+
+# save
+out_xlsx = OUTDIR / "ORDINAL_BAYES_STRICT_keyterms_managedFDR.xlsx"
+res.to_excel(out_xlsx, index=False)
+
+skip_xlsx = OUTDIR / "SKIPPED_ordinal_models.xlsx"
+skip_df.to_excel(skip_xlsx, index=False)
+
+print("\nSaved:", out_xlsx)
+print("Saved:", skip_xlsx)
+print("Figures saved to:", str(FIGDIR))
+print("Done.")
