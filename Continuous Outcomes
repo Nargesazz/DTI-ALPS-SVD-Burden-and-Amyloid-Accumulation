@@ -1,0 +1,420 @@
+# ============================================================
+# STRICT ALPS → SVD / Cognition / Amyloid (HABS-like)
+# Sessions: 1 baseline, 4 follow-up (~3y)
+# TimeYears: from NP_SessionDate (years since baseline per Subject)
+# LMM: outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+# Random intercept: Subject
+# Missing handling: model-wise complete-case (NO row dropping globally)
+# Outliers: winsorize outcome within each session (pre-specified)
+# Volume normalization: uses *_frac if available; otherwise computes from mm3/ICV_mm3
+# Managed BH-FDR: within families AND within each primary term:
+#   TimeYears, ALPS_baseline_z, TimeYears:ALPS_baseline_z
+# Figures: forest plots (matplotlib) and simple spaghetti/mean lines
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import statsmodels.formula.api as smf
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx"   # <-- edit
+
+ID_COL = "Subject"
+SESSION_COL = "Session"
+DATE_COL = "NP_SessionDate"
+
+ALPS_COL = "alps"
+ICV_COL = "ICV_mm3"
+
+# covariates (must exist in file; we will not "drop anything" globally)
+COVARS_RAW = ["Age", "Gender", "YrsOfEd"]   # baseline values derived per subject
+
+# Outcomes to fit (continuous only in this script)
+# Use fractions for volumes (ICV-normalized). If these columns exist, they will be used.
+# If missing, they will be computed from mm3/ICV_mm3 when possible.
+OUTCOMES = [
+    "choroid_volume",              # raw
+    "BG_PVS_frac",                 # fraction preferred
+    "WMH_frac",                    # fraction preferred
+    "CP_frac",                     # fraction preferred (must exist or have CP volume + ICV)
+    "PACC5",
+    "PIB_FS_DVR_FLR",
+    "ProcessingSpeed_proxy_zscore",
+]
+
+# Domain families for managed FDR
+FAMILIES = {
+    "Volumes":   {"BG_PVS_frac", "WMH_frac", "CP_frac", "choroid_volume"},
+    "Cognition": {"PACC5", "ProcessingSpeed_proxy_zscore"},
+    "Amyloid":   {"PIB_FS_DVR_FLR"},
+}
+
+# Sessions used
+BASELINE_SESSION = 1
+FOLLOWUP_SESSION = 4
+
+# Winsorization (pre-specified)
+WINSOR_P_LOW = 0.01
+WINSOR_P_HIGH = 0.99
+
+# Primary terms for managed FDR
+PRIMARY_TERMS_FOR_FDR = ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]
+
+# Output
+OUTDIR = Path(FILE_PATH).parent / "PY_STRICT_ALPS_LMM"
+FIGDIR = OUTDIR / "figures"
+OUTDIR.mkdir(parents=True, exist_ok=True)
+FIGDIR.mkdir(parents=True, exist_ok=True)
+
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def safe_numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+
+def parse_excel_date(x):
+    """Handle Excel numeric dates, strings, datetime."""
+    if pd.api.types.is_datetime64_any_dtype(x):
+        return pd.to_datetime(x, errors="coerce")
+    # try numeric excel serial
+    if pd.api.types.is_numeric_dtype(x):
+        # Excel origin (Windows): 1899-12-30
+        return pd.to_datetime("1899-12-30") + pd.to_timedelta(x, unit="D")
+    # fallback string parse
+    return pd.to_datetime(x, errors="coerce")
+
+
+def zscore(series: pd.Series) -> pd.Series:
+    m = series.mean(skipna=True)
+    sd = series.std(ddof=0, skipna=True)
+    if sd == 0 or np.isnan(sd):
+        return series * np.nan
+    return (series - m) / sd
+
+
+def bh_fdr(pvals):
+    p = np.asarray(pvals, float)
+    q = np.full_like(p, np.nan)
+    m = np.isfinite(p).sum()
+    if m == 0:
+        return q
+    order = np.argsort(p)
+    ranked = p[order]
+    qvals = ranked * m / (np.arange(1, m + 1))
+    qvals = np.minimum.accumulate(qvals[::-1])[::-1]
+    q[order] = qvals
+    return np.clip(q, 0, 1)
+
+
+def winsorize_series(s: pd.Series, p_low=0.01, p_high=0.99) -> pd.Series:
+    """Winsorize numeric series to [p_low, p_high] quantiles."""
+    x = safe_numeric(s).copy()
+    if x.dropna().shape[0] < 10:
+        return x
+    lo = x.quantile(p_low)
+    hi = x.quantile(p_high)
+    return x.clip(lower=lo, upper=hi)
+
+
+def ensure_volume_fractions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Use existing BG_PVS_frac / WMH_frac / CP_frac if present.
+    Otherwise compute BG_PVS_frac from BG_PVSvolume_mm3 / ICV_mm3,
+    and WMH_frac from total_WMH_vol_mm3 / ICV_mm3.
+    CP_frac: if missing and CP volume column exists, compute; otherwise leave missing.
+    """
+    # BG
+    if "BG_PVS_frac" not in df.columns and "BG_PVSvolume_mm3" in df.columns and ICV_COL in df.columns:
+        df["BG_PVS_frac"] = safe_numeric(df["BG_PVSvolume_mm3"]) / safe_numeric(df[ICV_COL])
+
+    # WMH
+    if "WMH_frac" not in df.columns and "total_WMH_vol_mm3" in df.columns and ICV_COL in df.columns:
+        df["WMH_frac"] = safe_numeric(df["total_WMH_vol_mm3"]) / safe_numeric(df[ICV_COL])
+
+    # CP (only if computable)
+    if "CP_frac" not in df.columns:
+        # try common CP volume column names (you can add yours here)
+        for cand in ["choroid_volume", "CP_volume_mm3", "CP_volume"]:
+            if cand in df.columns and ICV_COL in df.columns:
+                # NOTE: if cand == choroid_volume and it's not mm3, DO NOT compute.
+                # Only compute if clearly mm3:
+                if cand in ["CP_volume_mm3"]:
+                    df["CP_frac"] = safe_numeric(df[cand]) / safe_numeric(df[ICV_COL])
+                break
+
+    return df
+
+
+def get_family(outcome: str) -> str:
+    for fam, outs in FAMILIES.items():
+        if outcome in outs:
+            return fam
+    return "Other"
+
+
+def forest_plot(res_df: pd.DataFrame, term: str, out_png: Path, title: str, xlabel="Beta"):
+    d = res_df[res_df["term"] == term].copy()
+    d = d.dropna(subset=["beta", "se"]).sort_values("beta")
+    if d.shape[0] == 0:
+        return
+    y = np.arange(d.shape[0])
+    plt.figure(figsize=(8, max(3.5, 0.5 * d.shape[0])))
+    plt.errorbar(d["beta"], y, xerr=d["se"], fmt="o")
+    plt.axvline(0, color="black", linewidth=1)
+    plt.yticks(y, d["outcome"])
+    plt.xlabel(xlabel)
+    plt.title(title)
+    # annotate q if present
+    if "q_FDR" in d.columns:
+        for i, (_, r) in enumerate(d.iterrows()):
+            q = r.get("q_FDR", np.nan)
+            if np.isfinite(q):
+                plt.text(r["beta"], i, f"  q={q:.3f}", va="center", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+
+def plot_mean_over_time(df_long: pd.DataFrame, outcome: str, out_png: Path):
+    """
+    Simple descriptive plot: subject spaghetti (light) + mean per session (bold).
+    Uses raw outcome scale AFTER winsorization and any log transform you apply (we keep raw).
+    """
+    d = df_long[[ID_COL, SESSION_COL, "TimeYears", outcome]].copy()
+    d[outcome] = safe_numeric(d[outcome])
+    d = d.dropna(subset=[ID_COL, SESSION_COL, "TimeYears", outcome])
+    if d.shape[0] < 30:
+        return
+
+    # spaghetti
+    plt.figure(figsize=(7.8, 4.8))
+    for sid, g in d.groupby(ID_COL):
+        g = g.sort_values("TimeYears")
+        plt.plot(g["TimeYears"], g[outcome], alpha=0.15)
+
+    # mean line
+    m = d.groupby(SESSION_COL)[outcome].mean()
+    t = d.groupby(SESSION_COL)["TimeYears"].mean()
+    plt.plot(t.values, m.values, marker="o", linewidth=3)
+
+    plt.xlabel("TimeYears since baseline")
+    plt.ylabel(outcome)
+    plt.title(f"{outcome}: raw trajectory (winsorized within session)")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.close()
+
+
+# -----------------------------
+# LOAD & PREP (NO global drops)
+# -----------------------------
+df = pd.read_excel(FILE_PATH)
+
+# keep only sessions 1 & 4
+df[SESSION_COL] = safe_numeric(df[SESSION_COL]).astype("Int64")
+df = df[df[SESSION_COL].isin([BASELINE_SESSION, FOLLOWUP_SESSION])].copy()
+
+# make sure ID exists
+df[ID_COL] = df[ID_COL].astype(str)
+
+# parse dates -> TimeYears
+df[DATE_COL] = parse_excel_date(df[DATE_COL])
+
+# baseline date per subject (prefer session 1)
+base_date = (
+    df[df[SESSION_COL] == BASELINE_SESSION]
+    .groupby(ID_COL)[DATE_COL]
+    .min()
+)
+# if some subjects missing baseline date, fall back to min over available sessions
+fallback_base = df.groupby(ID_COL)[DATE_COL].min()
+base_date = base_date.combine_first(fallback_base)
+
+df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
+df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
+
+# normalize fractions if needed
+df = ensure_volume_fractions(df)
+
+# derive baseline covariates + baseline ALPS (do not drop globally)
+# Age_baseline
+if "Age" in df.columns:
+    age_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "Age"]]
+        .dropna()
+        .drop_duplicates(subset=[ID_COL])
+        .rename(columns={"Age": "Age_baseline"})
+    )
+    df = df.merge(age_base, on=ID_COL, how="left")
+else:
+    df["Age_baseline"] = np.nan
+
+# YrsOfEd baseline
+if "YrsOfEd" in df.columns:
+    edu_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "YrsOfEd"]]
+        .dropna()
+        .drop_duplicates(subset=[ID_COL])
+        .rename(columns={"YrsOfEd": "YrsOfEd_baseline"})
+    )
+    df = df.merge(edu_base, on=ID_COL, how="left")
+else:
+    df["YrsOfEd_baseline"] = np.nan
+
+# Gender baseline
+if "Gender" in df.columns:
+    gen_base = (
+        df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "Gender"]]
+        .dropna()
+        .drop_duplicates(subset=[ID_COL])
+        .rename(columns={"Gender": "Gender_baseline"})
+    )
+    df = df.merge(gen_base, on=ID_COL, how="left")
+else:
+    df["Gender_baseline"] = np.nan
+
+# baseline ALPS
+alps_base = (
+    df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, ALPS_COL]]
+    .dropna()
+    .drop_duplicates(subset=[ID_COL])
+    .rename(columns={ALPS_COL: "ALPS_baseline"})
+)
+df = df.merge(alps_base, on=ID_COL, how="left")
+df["ALPS_baseline_z"] = zscore(safe_numeric(df["ALPS_baseline"]))
+
+# ensure categorical for Gender baseline
+df["Gender_baseline"] = df["Gender_baseline"].astype("category")
+
+print("Loaded:", df.shape)
+print("Subjects:", df[ID_COL].nunique())
+print("Sessions:", sorted(df[SESSION_COL].dropna().unique().tolist()))
+print("ICV used:", ICV_COL if ICV_COL in df.columns else "None")
+print("Outcomes:", OUTCOMES)
+print("Output dir:", str(OUTDIR))
+
+
+# -----------------------------
+# FIT LMMs (per-outcome complete-case)
+# + winsorize outcome within session (pre-specified)
+# -----------------------------
+rows = []
+skipped = []
+
+for outcome in OUTCOMES:
+    if outcome not in df.columns:
+        skipped.append({"outcome": outcome, "reason": "missing column"})
+        continue
+
+    print("=" * 39)
+    print("Fitting outcome:", outcome)
+
+    d = df[[ID_COL, SESSION_COL, "TimeYears",
+            outcome, "ALPS_baseline_z",
+            "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
+
+    # numeric outcome
+    d[outcome] = safe_numeric(d[outcome])
+    d["TimeYears"] = safe_numeric(d["TimeYears"])
+    d["ALPS_baseline_z"] = safe_numeric(d["ALPS_baseline_z"])
+    d["Age_baseline"] = safe_numeric(d["Age_baseline"])
+    d["YrsOfEd_baseline"] = safe_numeric(d["YrsOfEd_baseline"])
+
+    # winsorize outcome within session (do not remove rows globally)
+    d["y_winsor"] = np.nan
+    for s in [BASELINE_SESSION, FOLLOWUP_SESSION]:
+        idx = d[SESSION_COL] == s
+        d.loc[idx, "y_winsor"] = winsorize_series(d.loc[idx, outcome], WINSOR_P_LOW, WINSOR_P_HIGH)
+
+    # model-wise complete-case for required columns
+    req_cols = [ID_COL, "y_winsor", "TimeYears", "ALPS_baseline_z", "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
+    dd = d.dropna(subset=req_cols).copy()
+
+    # minimal checks
+    n_rows = dd.shape[0]
+    n_sub = dd[ID_COL].nunique()
+    if n_rows < 40 or n_sub < 25:
+        skipped.append({"outcome": outcome, "reason": "too few rows/subjects after model-wise dropna",
+                        "n_rows": n_rows, "n_subjects": n_sub})
+        continue
+
+    # statsmodels MixedLM formula
+    # IMPORTANT: use Gender_baseline (baseline covariate), not session-specific Gender.
+    formula = (
+        "y_winsor ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z "
+        "+ Age_baseline + C(Gender_baseline) + YrsOfEd_baseline"
+    )
+
+    try:
+        model = smf.mixedlm(formula, dd, groups=dd[ID_COL])
+        fit = model.fit(reml=True, method="lbfgs")
+    except Exception as e:
+        skipped.append({"outcome": outcome, "reason": f"fit failed: {type(e).__name__}"})
+        continue
+
+    fam = get_family(outcome)
+
+    for term in PRIMARY_TERMS_FOR_FDR:
+        rows.append({
+            "outcome": outcome,
+            "family": fam,
+            "term": term,
+            "beta": float(fit.params.get(term, np.nan)),
+            "se": float(fit.bse.get(term, np.nan)),
+            "p": float(fit.pvalues.get(term, np.nan)),
+            "n_rows": int(n_rows),
+            "n_subjects": int(n_sub),
+        })
+
+    # descriptive trajectory plot
+    try:
+        plot_mean_over_time(df_long=dd.rename(columns={"y_winsor": outcome}), outcome=outcome,
+                            out_png=FIGDIR / f"TRAJ_{outcome}.png")
+    except Exception:
+        pass
+
+# results
+res = pd.DataFrame(rows)
+skip_df = pd.DataFrame(skipped)
+
+# -----------------------------
+# Managed BH-FDR (FIXED): apply to Time, ALPS, and ALPS×Time within families
+# -----------------------------
+res["q_FDR"] = np.nan
+for fam in res["family"].dropna().unique():
+    for term in PRIMARY_TERMS_FOR_FDR:
+        idx = (res["family"] == fam) & (res["term"] == term)
+        res.loc[idx, "q_FDR"] = bh_fdr(res.loc[idx, "p"].values)
+
+res["signif_q_lt_0p05"] = res["q_FDR"] < 0.05
+
+# Save outputs
+out_xlsx = OUTDIR / "LMM_CONTINUOUS_STRICT_MANAGED_FDR.xlsx"
+res.to_excel(out_xlsx, index=False)
+
+skip_xlsx = OUTDIR / "SKIPPED_outcomes.xlsx"
+skip_df.to_excel(skip_xlsx, index=False)
+
+print("\nSaved:", out_xlsx)
+print("Saved:", skip_xlsx)
+
+# Forest plots for all 3 primary terms
+forest_plot(res, "TimeYears", FIGDIR / "FOREST_TimeYears.png",
+            "TimeYears main effect (managed BH-FDR within family)", xlabel="Beta")
+forest_plot(res, "ALPS_baseline_z", FIGDIR / "FOREST_ALPS.png",
+            "ALPS baseline main effect (managed BH-FDR within family)", xlabel="Beta")
+forest_plot(res, "TimeYears:ALPS_baseline_z", FIGDIR / "FOREST_TimeYears_x_ALPS.png",
+            "TimeYears × ALPS interaction (managed BH-FDR within family)", xlabel="Beta")
+
+print("Figures saved to:", str(FIGDIR))
+print("Done.")
