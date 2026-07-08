@@ -1,0 +1,151 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os  # Essential for folder creation
+
+# ---------------------------
+# Setup Paths (Corrected)
+# ---------------------------
+# We define the folder path first
+base_path = r"C:\Users\user\Desktop\HABS"
+save_folder = os.path.join(base_path, "Figs")
+input_file = os.path.join(base_path, "combined results.xlsx")
+
+# Create the 'Figs' folder if it doesn't exist
+if not os.path.exists(save_folder):
+    os.makedirs(save_folder)
+    print(f"Created new folder: {save_folder}")
+
+# ---------------------------
+# Load data
+# ---------------------------
+print(f"Loading data from: {input_file}")
+df = pd.read_excel(input_file)
+
+# ---------------------------
+# 1. ROBUST COLUMN CLEANING
+# ---------------------------
+df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
+print("Columns found:", df.columns.tolist())
+
+# ---------------------------
+# 2. HANDLE MISSING COLUMNS
+# ---------------------------
+if "Analysis cat" not in df.columns:
+    print("WARNING: 'Analysis cat' column missing. Defaulting to 'Unspecified'.")
+    df["Analysis cat"] = "Unspecified"
+
+if "Variable cat" not in df.columns:
+    print("WARNING: 'Variable cat' column missing. Defaulting to 'All Variables'.")
+    df["Variable cat"] = "All Variables"
+
+# ---------------------------
+# 3. Ensure numeric columns
+# ---------------------------
+numeric_cols = ["beta", "se", "p", "p-corrected"]
+for col in numeric_cols:
+    if col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# ---------------------------
+# 4. Calculations
+# ---------------------------
+df["ci_low"]  = df["beta"] - 1.96 * df["se"]
+df["ci_high"] = df["beta"] + 1.96 * df["se"]
+df["FDR_sig"] = df["p-corrected"] < 0.05 if "p-corrected" in df.columns else False
+
+# Labeling
+df["label"] = df["outcome"].astype(str)
+
+# ---------------------------
+# 5. Plot Settings
+# ---------------------------
+COLORS = {
+    "Binary": "#1f77b4",     
+    "Continuous": "#2ca02c", 
+    "Ordinal": "#ff7f0e",    
+    "Unspecified": "black"   
+}
+
+# ---------------------------
+# 6. Forest plot function
+# ---------------------------
+def forest_plot(data, term):
+    term_data = data[data["term"] == term].copy()
+    
+    if term_data.empty:
+        print(f"No data found for term: {term}")
+        return
+
+    # Loop through Variable Categories (First level of separation)
+    unique_vars = term_data["Variable cat"].unique()
+    
+    for var_cat in unique_vars:
+        # Filter by Variable Category
+        var_subset = term_data[term_data["Variable cat"] == var_cat]
+
+        # Loop through Analysis Categories (Second level of separation)
+        # This ensures we don't mix "Binary" and "Continuous" in one plot unless you want to
+        unique_ana = var_subset["Analysis cat"].unique()
+
+        for ana_cat in unique_ana:
+            d = var_subset[var_subset["Analysis cat"] == ana_cat].sort_values("beta")
+            
+            if d.empty: continue
+
+            # Dynamic height
+            h = max(4, 0.4 * len(d))
+            fig, ax = plt.subplots(figsize=(8, h))
+            
+            y = np.arange(len(d))
+
+            # Plot Error Bars
+            ax.errorbar(
+                x=d["beta"],
+                y=y,
+                xerr=[d["beta"] - d["ci_low"], d["ci_high"] - d["beta"]],
+                fmt="o",
+                color=COLORS.get(ana_cat, "black"),
+                ecolor=COLORS.get(ana_cat, "black"),
+                capsize=3,
+                label=ana_cat
+            )
+
+            # Highlight Significant points
+            sig_idx = d["FDR_sig"]
+            if sig_idx.any():
+                ax.scatter(d.loc[sig_idx, "beta"], y[sig_idx], color="red", s=50, zorder=10, label="p-corr < 0.05")
+
+            # Formatting
+            ax.axvline(0, linestyle="--", color="gray", linewidth=1)
+            ax.set_yticks(y)
+            ax.set_yticklabels(d["label"])
+            ax.set_xlabel(f"Beta ({term}) with 95% CI")
+            ax.set_title(f"Term: {term}\nGroup: {var_cat} | Type: {ana_cat}")
+            ax.grid(axis='x', linestyle=':', alpha=0.5)
+
+            # --- SAVING LOGIC (Correctly placed inside the loop) ---
+            safe_term = str(term).replace("*", "_x_").replace("/", "-")
+            safe_var = str(var_cat).replace(" ", "_").replace("/", "-")
+            safe_ana = str(ana_cat).replace(" ", "_")
+
+            filename = f"Plot_{safe_term}_{safe_var}_{safe_ana}.png"
+            full_save_path = os.path.join(save_folder, filename)
+
+            plt.tight_layout()
+            plt.savefig(full_save_path, dpi=300, bbox_inches='tight')
+            print(f"Saved: {filename}")
+
+            plt.close(fig) # Close to free memory
+
+# ---------------------------
+# 7. Generate plots
+# ---------------------------
+terms_to_plot = ["ALPS_baseline_z", "Time", "Time*ALPS_baseline_z"]
+
+print("Starting plot generation...")
+for term in terms_to_plot:
+    forest_plot(df, term)
+
+print(f"\nProcessing complete. Check folder: {save_folder}")
+
