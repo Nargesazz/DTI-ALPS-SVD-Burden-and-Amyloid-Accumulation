@@ -1,111 +1,316 @@
-#for binary outcomes:
+# ============================================================
+# STRICT ALPS -> BINARY OUTCOMES (Bayesian mixed-effects)
+# Sessions: 1 baseline, 4 follow-up (~3y)
+# TimeYears: from NP_SessionDate (years since baseline per Subject)
+# Model: Bernoulli mixed model with random intercept for Subject
+# Outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+# Missing handling: model-wise complete-case (NO global drops)
+# ============================================================
+
 import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
-import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
-from scipy.stats import zscore
+import bambi as bmb
+import arviz as az
 
-# Suppress warnings
-warnings.filterwarnings("ignore")
-
-# File paths and columns setup
+# -----------------------------
+# SETTINGS
+# -----------------------------
 FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx"
+
 ID_COL = "Subject"
 SESSION_COL = "Session"
 DATE_COL = "NP_SessionDate"
+ALPS_COL = "alps"
+
 BASELINE_SESSION = 1
 FOLLOWUP_SESSION = 4
 
-# Binary outcomes (Key binary variables)
 BINARY_OUTCOMES = [
     "Radiologist_PVS_MidBrain",
     "Lacune_Presence",
-    "Radiologist_MARS_Infratentorial",
-    "Radiologist_MARS_Deep",
-    "Radiologist_MARS_Lobar",
-    "Radiologist_BOMBS_Lobar",
-    "Radiologist_BOMBS_BG",
-    "Radiologist_BOMBS_Posterior_Fossa"
+    "MARS_Infratentorial",
+    "MARS_Deep",
+    "MARS_Lobar",
+    "BOMBS_Lobar",
+    "BOMBS_BG",
+    "BOMBS_Posterior_Fossa"
 ]
 
-# Covariates
-COVARS = ["Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
+PRIMARY_TERMS = ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]
 
-# Output directory
-OUTDIR = Path(FILE_PATH).parent / "PY_STRICT_ALPS_Binary"
+DRAWS = 2000
+TUNE = 2000
+CHAINS = 4
+CORES = 4
+TARGET_ACCEPT = 0.95
+RANDOM_SEED = 42
+
+OUTDIR = Path(FILE_PATH).parent / "PY_STRICT_ALPS_BINARY_BAYES"
+FIGDIR = OUTDIR / "figures"
 OUTDIR.mkdir(parents=True, exist_ok=True)
+FIGDIR.mkdir(parents=True, exist_ok=True)
 
-# Read data from the file
+# -----------------------------
+# HELPERS
+# -----------------------------
+def safe_numeric(s):
+    return pd.to_numeric(s, errors="coerce")
+
+def parse_excel_date_series(s):
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s, errors="coerce")
+
+    sn = pd.to_numeric(s, errors="coerce")
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+
+    num_mask = sn.notna()
+    if num_mask.any():
+        out.loc[num_mask] = pd.to_datetime(
+            sn.loc[num_mask], unit="D", origin="1899-12-30", errors="coerce"
+        )
+
+    str_mask = out.isna()
+    if str_mask.any():
+        out.loc[str_mask] = pd.to_datetime(s.loc[str_mask], errors="coerce")
+
+    return out
+
+def zscore(series):
+    x = safe_numeric(series)
+    m = x.mean(skipna=True)
+    sd = x.std(ddof=0, skipna=True)
+    if sd == 0 or np.isnan(sd):
+        return x * np.nan
+    return (x - m) / sd
+
+def bh_fdr(pvals):
+    p = np.asarray(pvals, float)
+    q = np.full_like(p, np.nan)
+    finite = np.isfinite(p)
+    m = finite.sum()
+    if m == 0:
+        return q
+    order = np.argsort(p[finite])
+    ranked = p[finite][order]
+    qvals = ranked * m / (np.arange(1, m + 1))
+    qvals = np.minimum.accumulate(qvals[::-1])[::-1]
+    q_finite = np.empty(m, dtype=float)
+    q_finite[order] = qvals
+    q[finite] = np.clip(q_finite, 0, 1)
+    return q
+
+def draw_vector(idata, term):
+    try:
+        arr = idata.posterior[term].values
+        return arr.reshape(-1)
+    except Exception:
+        return None
+
+def post_prob_positive(draws):
+    return float(np.mean(draws > 0))
+
+def post_p_two_sided(draws):
+    ppos = np.mean(draws > 0)
+    pneg = np.mean(draws < 0)
+    return float(2 * min(ppos, pneg))
+
+def merge_baseline_cov(df_in, col, newcol):
+    if col in df_in.columns:
+        tmp = (
+            df_in[df_in[SESSION_COL] == BASELINE_SESSION][[ID_COL, col]]
+            .dropna()
+            .drop_duplicates(subset=[ID_COL])
+            .rename(columns={col: newcol})
+        )
+        return df_in.merge(tmp, on=ID_COL, how="left")
+    else:
+        df_in[newcol] = np.nan
+        return df_in
+
+# -----------------------------
+# LOAD & PREP
+# -----------------------------
 df = pd.read_excel(FILE_PATH)
 
-# Check if all necessary columns exist
-print("Columns in dataset:", df.columns)
+df[SESSION_COL] = safe_numeric(df[SESSION_COL]).astype("Int64")
+df = df[df[SESSION_COL].isin([BASELINE_SESSION, FOLLOWUP_SESSION])].copy()
+df[ID_COL] = df[ID_COL].astype(str)
 
-# Preprocess: Ensure baseline covariates (Age, Gender, Education)
-df["Age_baseline"] = df["Age"]
-df["Gender_baseline"] = df["Gender"]
-df["YrsOfEd_baseline"] = df["YrsOfEd"]
+df[DATE_COL] = parse_excel_date_series(df[DATE_COL])
 
-# Create a 'TimeYears' column based on the session date
-df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors='coerce')
-base_date = df[df[SESSION_COL] == BASELINE_SESSION].groupby(ID_COL)[DATE_COL].min()
+base_date = (
+    df[df[SESSION_COL] == BASELINE_SESSION]
+    .groupby(ID_COL)[DATE_COL]
+    .min()
+)
+fallback_base = df.groupby(ID_COL)[DATE_COL].min()
+base_date = base_date.combine_first(fallback_base)
+
 df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
 df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
+df["TimeYears"] = safe_numeric(df["TimeYears"])
 
-# Fix: If ALPS baseline is missing, replace it with the z-score of ALPS
-df['ALPS_baseline_z'] = zscore(df['alps'], nan_policy='omit')
+df = merge_baseline_cov(df, "Age", "Age_baseline")
+df = merge_baseline_cov(df, "Gender", "Gender_baseline")
+df = merge_baseline_cov(df, "YrsOfEd", "YrsOfEd_baseline")
+df["Gender_baseline"] = df["Gender_baseline"].astype("category")
 
-# Prepare outcome models
-rows = []  # Store results
-skipped = []  # Store skipped models
+if ALPS_COL not in df.columns:
+    raise ValueError(f"Missing required ALPS column: {ALPS_COL}")
 
-# Loop through the binary outcomes
+alps_base = (
+    df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, ALPS_COL]]
+    .dropna()
+    .drop_duplicates(subset=[ID_COL])
+    .rename(columns={ALPS_COL: "ALPS_baseline"})
+)
+df = df.merge(alps_base, on=ID_COL, how="left")
+df["ALPS_baseline_z"] = zscore(df["ALPS_baseline"])
+
+df[ID_COL] = df[ID_COL].astype("category")
+
+print("Loaded:", df.shape)
+print("Subjects:", df[ID_COL].nunique())
+
+# -----------------------------
+# FIT BAYESIAN BINARY MIXED MODELS
+# -----------------------------
+rows = []
+skipped = []
+
 for outcome in BINARY_OUTCOMES:
-    print(f"=======================================")
-    print(f"Fitting outcome: {outcome}")
-    
+    print("=" * 50)
+    print("Fitting outcome:", outcome)
+
     if outcome not in df.columns:
         skipped.append({"outcome": outcome, "reason": "missing column"})
         continue
-    
-    d = df[[ID_COL, SESSION_COL, "TimeYears", outcome, "ALPS_baseline_z", "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
-    
-    # Ensure the outcome is numeric
-    d[outcome] = pd.to_numeric(d[outcome], errors='coerce')
 
-    # Model-wise complete case (dropping rows with missing values in any of the necessary columns)
-    required_cols = [ID_COL, SESSION_COL, "TimeYears", outcome, "ALPS_baseline_z", "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
-    d = d.dropna(subset=required_cols)
+    d = df[[ID_COL, outcome, "TimeYears", "ALPS_baseline_z",
+            "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
 
-    # Fit the logistic regression model for binary outcomes
+    d[outcome] = safe_numeric(d[outcome])
+
+    # Strict binary check
+    d = d[d[outcome].isin([0, 1]) | d[outcome].isna()].copy()
+
+    d = d.dropna()
+
+    n_rows = int(d.shape[0])
+    n_subjects = int(d[ID_COL].nunique())
+
+    if n_rows < 40 or n_subjects < 20:
+        skipped.append({
+            "outcome": outcome,
+            "reason": "too few rows/subjects after complete-case",
+            "n_rows": n_rows,
+            "n_subjects": n_subjects
+        })
+        continue
+
+    if d[outcome].nunique() < 2:
+        skipped.append({
+            "outcome": outcome,
+            "reason": "outcome has only one class after filtering",
+            "n_rows": n_rows,
+            "n_subjects": n_subjects
+        })
+        continue
+
+    formula = (
+        f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z "
+        f"+ Age_baseline + C(Gender_baseline) + YrsOfEd_baseline + (1|{ID_COL})"
+    )
+
     try:
-        formula = f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + Age_baseline + C(Gender_baseline) + YrsOfEd_baseline"
-        model = smf.logit(formula, data=d)
-        fit = model.fit()
+        model = bmb.Model(formula, d, family="bernoulli")
+        idata = model.fit(
+            draws=DRAWS,
+            tune=TUNE,
+            chains=CHAINS,
+            cores=CORES,
+            target_accept=TARGET_ACCEPT,
+            random_seed=RANDOM_SEED
+        )
+    except Exception as e:
+        skipped.append({
+            "outcome": outcome,
+            "reason": f"fit failed: {type(e).__name__}",
+            "detail": str(e)[:200]
+        })
+        continue
 
-        # Save the results for the key terms
-        for term in ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]:
+    summ = az.summary(idata, hdi_prob=0.95).reset_index().rename(columns={"index": "term"})
+
+    for term in PRIMARY_TERMS:
+        draws = draw_vector(idata, term)
+
+        if draws is None or len(draws) == 0:
             rows.append({
                 "outcome": outcome,
                 "term": term,
-                "beta": fit.params.get(term, np.nan),
-                "se": fit.bse.get(term, np.nan),
-                "p": fit.pvalues.get(term, np.nan),
-                "n_rows": len(d),
-                "n_subjects": d[ID_COL].nunique()
+                "mean": np.nan,
+                "sd": np.nan,
+                "hdi_2.5%": np.nan,
+                "hdi_97.5%": np.nan,
+                "P(beta>0)": np.nan,
+                "post_p_two_sided": np.nan,
+                "odds_ratio_mean": np.nan,
+                "or_hdi_2.5%": np.nan,
+                "or_hdi_97.5%": np.nan,
+                "n_rows": n_rows,
+                "n_subjects": n_subjects,
+                "status": "TERM_NOT_FOUND"
             })
-        
-    except Exception as e:
-        skipped.append({"outcome": outcome, "reason": f"fit failed: {type(e).__name__}"})
+            continue
 
-# Save results to Excel
-res_df = pd.DataFrame(rows)
-skipped_df = pd.DataFrame(skipped)
-res_df.to_excel(OUTDIR / "LMM_Binary_FDR_Results.xlsx", index=False)
-skipped_df.to_excel(OUTDIR / "Skipped_Binary_Outcomes.xlsx", index=False)
+        term_row = summ[summ["term"] == term]
+        if term_row.empty:
+            mean = float(np.mean(draws))
+            sd = float(np.std(draws, ddof=0))
+            hdi_lo, hdi_hi = np.quantile(draws, [0.025, 0.975])
+        else:
+            term_row = term_row.iloc[0]
+            mean = float(term_row["mean"])
+            sd = float(term_row["sd"])
+            hdi_lo = float(term_row["hdi_2.5%"])
+            hdi_hi = float(term_row["hdi_97.5%"])
 
-print("Results saved to:", OUTDIR / "LMM_Binary_FDR_Results.xlsx")
-print("Skipped outcomes saved to:", OUTDIR / "Skipped_Binary_Outcomes.xlsx")
+        rows.append({
+            "outcome": outcome,
+            "term": term,
+            "mean": mean,
+            "sd": sd,
+            "hdi_2.5%": hdi_lo,
+            "hdi_97.5%": hdi_hi,
+            "P(beta>0)": post_prob_positive(draws),
+            "post_p_two_sided": post_p_two_sided(draws),
+            "odds_ratio_mean": float(np.exp(mean)),
+            "or_hdi_2.5%": float(np.exp(hdi_lo)),
+            "or_hdi_97.5%": float(np.exp(hdi_hi)),
+            "n_rows": n_rows,
+            "n_subjects": n_subjects,
+            "status": "OK"
+        })
 
+res = pd.DataFrame(rows)
+skip_df = pd.DataFrame(skipped)
+
+res["q_FDR"] = np.nan
+for term in PRIMARY_TERMS:
+    idx = (res["term"] == term) & (res["status"] == "OK")
+    res.loc[idx, "q_FDR"] = bh_fdr(res.loc[idx, "post_p_two_sided"].values)
+
+res["signif_q_lt_0p05"] = res["q_FDR"] < 0.05
+
+res.to_excel(OUTDIR / "BINARY_BAYES_STRICT_keyterms_managedFDR.xlsx", index=False)
+skip_df.to_excel(OUTDIR / "SKIPPED_binary_models.xlsx", index=False)
+
+print("Saved results to:", OUTDIR / "BINARY_BAYES_STRICT_keyterms_managedFDR.xlsx")
+print("Saved skipped log to:", OUTDIR / "SKIPPED_binary_models.xlsx")
+print("Done.")
