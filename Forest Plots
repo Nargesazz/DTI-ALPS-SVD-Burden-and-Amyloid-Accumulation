@@ -1,151 +1,217 @@
-import pandas as pd
+import os
+import re
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import os  # Essential for folder creation
 
 # ---------------------------
-# Setup Paths (Corrected)
+# Paths
 # ---------------------------
-# We define the folder path first
 base_path = r"C:\Users\user\Desktop\HABS"
+input_file = os.path.join(base_path, "combined_selected_outcomes_BH_FamilyWise.xlsx")
 save_folder = os.path.join(base_path, "Figs")
-input_file = os.path.join(base_path, "combined results.xlsx")
-
-# Create the 'Figs' folder if it doesn't exist
-if not os.path.exists(save_folder):
-    os.makedirs(save_folder)
-    print(f"Created new folder: {save_folder}")
+os.makedirs(save_folder, exist_ok=True)
 
 # ---------------------------
-# Load data
+# Terms to plot
 # ---------------------------
-print(f"Loading data from: {input_file}")
-df = pd.read_excel(input_file)
+terms_to_plot = [
+    "ALPS_baseline_z",
+    "Time",
+    "Time*ALPS_baseline_z",
+]
 
 # ---------------------------
-# 1. ROBUST COLUMN CLEANING
+# Helpers
 # ---------------------------
-df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
-print("Columns found:", df.columns.tolist())
+def safe_name(text):
+    text = str(text).strip()
+    text = re.sub(r"[^\w\-.]+", "_", text)
+    return text
 
-# ---------------------------
-# 2. HANDLE MISSING COLUMNS
-# ---------------------------
-if "Analysis cat" not in df.columns:
-    print("WARNING: 'Analysis cat' column missing. Defaulting to 'Unspecified'.")
-    df["Analysis cat"] = "Unspecified"
+def clean_columns(df):
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+    )
+    return df
 
-if "Variable cat" not in df.columns:
-    print("WARNING: 'Variable cat' column missing. Defaulting to 'All Variables'.")
-    df["Variable cat"] = "All Variables"
+def find_first_existing_column(df, candidates, required=False):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(f"None of these columns were found: {candidates}")
+    return None
 
-# ---------------------------
-# 3. Ensure numeric columns
-# ---------------------------
-numeric_cols = ["beta", "se", "p", "p-corrected"]
-for col in numeric_cols:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+def load_data(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found:\n{path}")
 
-# ---------------------------
-# 4. Calculations
-# ---------------------------
-df["ci_low"]  = df["beta"] - 1.96 * df["se"]
-df["ci_high"] = df["beta"] + 1.96 * df["se"]
-df["FDR_sig"] = df["p-corrected"] < 0.05 if "p-corrected" in df.columns else False
+    df = pd.read_excel(path)
+    df = clean_columns(df)
 
-# Labeling
-df["label"] = df["outcome"].astype(str)
+    print("\nDetected columns:")
+    print(df.columns.tolist())
 
-# ---------------------------
-# 5. Plot Settings
-# ---------------------------
-COLORS = {
-    "Binary": "#1f77b4",     
-    "Continuous": "#2ca02c", 
-    "Ordinal": "#ff7f0e",    
-    "Unspecified": "black"   
-}
+    outcome_col = find_first_existing_column(df, ["outcome"], required=True)
+    term_col = find_first_existing_column(df, ["term"], required=True)
+    beta_col = find_first_existing_column(df, ["beta"], required=True)
 
-# ---------------------------
-# 6. Forest plot function
-# ---------------------------
-def forest_plot(data, term):
-    term_data = data[data["term"] == term].copy()
-    
-    if term_data.empty:
-        print(f"No data found for term: {term}")
+    sig_col = find_first_existing_column(
+        df,
+        ["Significancy", "signif_q_lt_0p05"],
+        required=False
+    )
+
+    q_col = find_first_existing_column(
+        df,
+        ["q_FDR", "p-corrected"],
+        required=False
+    )
+
+    low_col = find_first_existing_column(
+        df,
+        ["HDI95_low", "hdi_2.5%", "ci_low"],
+        required=False
+    )
+
+    high_col = find_first_existing_column(
+        df,
+        ["HDI95_high", "hdi_97.5%", "ci_high"],
+        required=False
+    )
+
+    se_col = find_first_existing_column(df, ["se"], required=False)
+
+    for col in [beta_col, low_col, high_col, se_col, q_col]:
+        if col is not None:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["outcome_std"] = df[outcome_col].astype(str).str.strip()
+    df["term_std"] = df[term_col].astype(str).str.strip()
+    df["beta_std"] = df[beta_col]
+
+    if low_col is not None and high_col is not None:
+        df["low_std"] = df[low_col]
+        df["high_std"] = df[high_col]
+        interval_label = "95% HDI"
+        ref_line = 0
+        print(f"\nUsing interval columns: {low_col}, {high_col}")
+    elif se_col is not None:
+        df["low_std"] = df["beta_std"] - 1.96 * df[se_col]
+        df["high_std"] = df["beta_std"] + 1.96 * df[se_col]
+        interval_label = "Wald 95% CI"
+        ref_line = 0
+        print("\nHDI columns not found. Using beta ± 1.96*se")
+    else:
+        raise ValueError("No interval columns found, and no 'se' column available for fallback.")
+
+    if sig_col is not None:
+        if df[sig_col].dtype == object:
+            df["sig_std"] = df[sig_col].astype(str).str.strip().str.lower().isin(
+                ["true", "1", "yes", "significant", "sig"]
+            )
+        else:
+            df["sig_std"] = df[sig_col].fillna(False).astype(bool)
+    elif q_col is not None:
+        df["sig_std"] = df[q_col] < 0.05
+    else:
+        df["sig_std"] = False
+
+    return df, interval_label, ref_line
+
+def forest_plot_single_panel(df, term, interval_label="95% HDI", ref_line=0):
+    d = df[df["term_std"] == term].copy()
+
+    if d.empty:
+        print(f"No data for term: {term}")
         return
 
-    # Loop through Variable Categories (First level of separation)
-    unique_vars = term_data["Variable cat"].unique()
-    
-    for var_cat in unique_vars:
-        # Filter by Variable Category
-        var_subset = term_data[term_data["Variable cat"] == var_cat]
+    d = d.dropna(subset=["beta_std", "low_std", "high_std", "outcome_std"])
+    if d.empty:
+        print(f"No plottable rows for term: {term}")
+        return
 
-        # Loop through Analysis Categories (Second level of separation)
-        # This ensures we don't mix "Binary" and "Continuous" in one plot unless you want to
-        unique_ana = var_subset["Analysis cat"].unique()
+    # Sort from highest beta to lowest beta
+    d = d.sort_values("beta_std", ascending=False).reset_index(drop=True)
 
-        for ana_cat in unique_ana:
-            d = var_subset[var_subset["Analysis cat"] == ana_cat].sort_values("beta")
-            
-            if d.empty: continue
+    # Only outcome names, no brackets, no family labels
+    d["label"] = d["outcome_std"]
 
-            # Dynamic height
-            h = max(4, 0.4 * len(d))
-            fig, ax = plt.subplots(figsize=(8, h))
-            
-            y = np.arange(len(d))
+    y = np.arange(len(d))
+    fig_height = max(6, 0.4 * len(d))
+    fig, ax = plt.subplots(figsize=(12, fig_height))
 
-            # Plot Error Bars
-            ax.errorbar(
-                x=d["beta"],
-                y=y,
-                xerr=[d["beta"] - d["ci_low"], d["ci_high"] - d["beta"]],
-                fmt="o",
-                color=COLORS.get(ana_cat, "black"),
-                ecolor=COLORS.get(ana_cat, "black"),
-                capsize=3,
-                label=ana_cat
-            )
+    sig_mask = d["sig_std"].fillna(False).astype(bool)
 
-            # Highlight Significant points
-            sig_idx = d["FDR_sig"]
-            if sig_idx.any():
-                ax.scatter(d.loc[sig_idx, "beta"], y[sig_idx], color="red", s=50, zorder=10, label="p-corr < 0.05")
+    for i, row in d.iterrows():
+        is_sig = bool(row["sig_std"]) if pd.notna(row["sig_std"]) else False
+        point_color = "red" if is_sig else "black"
 
-            # Formatting
-            ax.axvline(0, linestyle="--", color="gray", linewidth=1)
-            ax.set_yticks(y)
-            ax.set_yticklabels(d["label"])
-            ax.set_xlabel(f"Beta ({term}) with 95% CI")
-            ax.set_title(f"Term: {term}\nGroup: {var_cat} | Type: {ana_cat}")
-            ax.grid(axis='x', linestyle=':', alpha=0.5)
+        xerr_low = row["beta_std"] - row["low_std"]
+        xerr_high = row["high_std"] - row["beta_std"]
 
-            # --- SAVING LOGIC (Correctly placed inside the loop) ---
-            safe_term = str(term).replace("*", "_x_").replace("/", "-")
-            safe_var = str(var_cat).replace(" ", "_").replace("/", "-")
-            safe_ana = str(ana_cat).replace(" ", "_")
+        ax.errorbar(
+            x=row["beta_std"],
+            y=i,
+            xerr=[[xerr_low], [xerr_high]],
+            fmt="none",
+            ecolor="black",
+            elinewidth=1.5,
+            capsize=3,
+            zorder=2
+        )
 
-            filename = f"Plot_{safe_term}_{safe_var}_{safe_ana}.png"
-            full_save_path = os.path.join(save_folder, filename)
+        ax.scatter(
+            row["beta_std"],
+            i,
+            color=point_color,
+            s=36,
+            zorder=3
+        )
 
-            plt.tight_layout()
-            plt.savefig(full_save_path, dpi=300, bbox_inches='tight')
-            print(f"Saved: {filename}")
+    ax.axvline(ref_line, linestyle="--", color="gray", linewidth=1)
+    ax.set_yticks(y)
+    ax.set_yticklabels(d["label"])
+    ax.invert_yaxis()
+    ax.set_xlabel(f"Effect estimate ({interval_label})")
+    ax.set_title(f"Forest plot for {term}")
+    ax.grid(axis="x", linestyle=":", alpha=0.5)
 
-            plt.close(fig) # Close to free memory
+    xmin = np.nanmin(d["low_std"])
+    xmax = np.nanmax(d["high_std"])
+    if np.isfinite(xmin) and np.isfinite(xmax):
+        pad = max((xmax - xmin) * 0.08, 0.02)
+        ax.set_xlim(xmin - pad, xmax + pad)
+
+    if sig_mask.any():
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="black", linestyle="", label="Not significant"),
+            plt.Line2D([0], [0], marker="o", color="red", linestyle="", label="Significant"),
+        ]
+        ax.legend(handles=handles, frameon=False, loc="best")
+
+    filename = f"Plot_{safe_name(term)}_ALL.png"
+    full_path = os.path.join(save_folder, filename)
+
+    plt.tight_layout()
+    plt.savefig(full_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {full_path}")
 
 # ---------------------------
-# 7. Generate plots
+# Main
 # ---------------------------
-terms_to_plot = ["ALPS_baseline_z", "Time", "Time*ALPS_baseline_z"]
+df, interval_label, ref_line = load_data(input_file)
 
-print("Starting plot generation...")
+print("\nUnique terms found in file:")
+print(sorted(df["term_std"].dropna().unique().tolist()))
+
 for term in terms_to_plot:
-    forest_plot(df, term)
+    forest_plot_single_panel(df, term, interval_label=interval_label, ref_line=ref_line)
 
-print(f"\nProcessing complete. Check folder: {save_folder}")
-
+print("\nDone.")
