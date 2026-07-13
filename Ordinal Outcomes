@@ -3,7 +3,7 @@
 # Sessions: 1 baseline, 4 follow-up (~3y)
 # TimeYears: from NP_SessionDate (years since baseline per Subject)
 # Model: cumulative ordinal mixed model with random intercept (Subject)
-# Outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+# Outcome ~ TimeYears_z + ALPS_baseline_z + TimeYears_z:ALPS_baseline_z + covars
 #
 # Missing handling: model-wise complete-case (NO global drops)
 # Sparse categories: collapse rare levels (pre-specified min count)
@@ -49,7 +49,6 @@ ORDINAL_OUTCOMES = [
     "Radiologist_BOMBS_Lobar",
     "Radiologist_BOMBS_BG",
     "Radiologist_BOMBS_Posterior_Fossa",
-    # If Lacune_Presence is binary, keep it OUT of ordinal and model separately
 ]
 
 # Baseline covariates
@@ -58,8 +57,8 @@ COVARS = ["Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]
 # Sparse category collapsing
 MIN_LEVEL_COUNT = 10   # pre-specified: levels with <10 observations are collapsed
 
-# Primary terms for reporting / managed FDR
-PRIMARY_TERMS = ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]
+# Primary terms for reporting / managed FDR (Updated to use TimeYears_z)
+PRIMARY_TERMS = ["TimeYears_z", "ALPS_baseline_z", "TimeYears_z:ALPS_baseline_z"]
 
 # MCMC settings (paper-safe defaults)
 DRAWS = 2000
@@ -109,61 +108,44 @@ def bh_fdr(pvals):
     return np.clip(q, 0, 1)
 
 def collapse_sparse_levels(y: pd.Series, min_count=10):
-    """
-    Collapse sparse ordinal levels into nearest neighbor levels.
-    Strategy (strict, deterministic):
-      - compute counts by level
-      - while any level has count < min_count:
-          merge the smallest-count level into the closest adjacent level (by numeric distance)
-    """
     yy = safe_numeric(y).dropna()
     if yy.nunique() < 3:
         return y  # do not touch binary/2-level here
 
-    # work on numeric levels
     levels = sorted(yy.unique().tolist())
     counts = yy.value_counts().to_dict()
 
-    # helper: closest neighbor
     def closest_neighbor(level, levels):
         idx = levels.index(level)
         if idx == 0:
             return levels[1]
         if idx == len(levels) - 1:
             return levels[-2]
-        # choose adjacent with higher count (more stable); if tie, choose lower distance (equal)
         left = levels[idx - 1]
         right = levels[idx + 1]
         return left if counts.get(left, 0) >= counts.get(right, 0) else right
 
-    # iterative merging
     levels_work = levels[:]
     counts_work = counts.copy()
 
     changed = True
     while changed:
         changed = False
-        # find sparse levels
         sparse = [lv for lv in levels_work if counts_work.get(lv, 0) < min_count]
         if not sparse:
             break
 
-        # merge the sparsest first
         lv = sorted(sparse, key=lambda z: counts_work.get(z, 0))[0]
         nb = closest_neighbor(lv, levels_work)
 
-        # apply merge in data
         y = y.replace({lv: nb})
 
-        # update counts
         counts_work[nb] = counts_work.get(nb, 0) + counts_work.get(lv, 0)
         counts_work[lv] = 0
 
-        # remove level
         levels_work = [x for x in levels_work if x != lv]
         changed = True
 
-        # stop if too few categories remain
         if len(levels_work) < 3:
             break
 
@@ -193,7 +175,6 @@ def paired_stacked_plot(df_long, outcome, out_png):
     d[outcome] = safe_numeric(d[outcome])
     d = d.dropna()
 
-    # paired only
     wide = d.pivot_table(index=ID_COL, columns=SESSION_COL, values=outcome, aggfunc="first")
     if (BASELINE_SESSION not in wide.columns) or (FOLLOWUP_SESSION not in wide.columns):
         return
@@ -240,7 +221,6 @@ df[ID_COL] = df[ID_COL].astype(str)
 
 df[DATE_COL] = parse_excel_date(df[DATE_COL])
 
-# baseline date per subject (prefer session 1)
 base_date = (
     df[df[SESSION_COL] == BASELINE_SESSION]
     .groupby(ID_COL)[DATE_COL].min()
@@ -252,7 +232,9 @@ df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
 df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
 df["TimeYears"] = safe_numeric(df["TimeYears"])
 
-# baseline covariates
+# Compute TimeYears_z immediately
+df["TimeYears_z"] = zscore(df["TimeYears"])
+
 if "Age" in df.columns:
     age_base = (
         df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, "Age"]]
@@ -285,7 +267,6 @@ else:
 
 df["Gender_baseline"] = df["Gender_baseline"].astype("category")
 
-# baseline ALPS z
 df[ALPS_COL] = safe_numeric(df[ALPS_COL])
 alps_base = (
     df[df[SESSION_COL] == BASELINE_SESSION][[ID_COL, ALPS_COL]]
@@ -295,7 +276,6 @@ alps_base = (
 df = df.merge(alps_base, on=ID_COL, how="left")
 df["ALPS_baseline_z"] = zscore(df["ALPS_baseline"])
 
-# group as category for bambi
 df[ID_COL] = df[ID_COL].astype("category")
 
 print("Loaded:", df.shape, "| Subjects:", df[ID_COL].nunique())
@@ -312,22 +292,19 @@ for outcome in ORDINAL_OUTCOMES:
         skipped.append({"outcome": outcome, "reason": "missing column"})
         continue
 
-    d = df[[outcome, ID_COL, "TimeYears", "ALPS_baseline_z",
+    # Use TimeYears_z in model-wise complete cases extraction
+    d = df[[outcome, ID_COL, "TimeYears_z", "ALPS_baseline_z",
             "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
 
-    # numeric ordinal values
     d[outcome] = safe_numeric(d[outcome])
 
-    # collapse sparse levels (strict, pre-specified)
     d[outcome] = collapse_sparse_levels(d[outcome], min_count=MIN_LEVEL_COUNT)
 
-    # model-wise complete-case
     d = d.dropna()
 
     n_sub = int(d[ID_COL].nunique())
     n_rows = int(d.shape[0])
 
-    # must have >=3 ordered categories for ordinal (strict)
     if d[outcome].nunique() < 3:
         skipped.append({"outcome": outcome, "reason": "<3 categories after collapse/complete-case",
                         "n_rows": n_rows, "n_subjects": n_sub})
@@ -338,12 +315,11 @@ for outcome in ORDINAL_OUTCOMES:
                         "n_rows": n_rows, "n_subjects": n_sub})
         continue
 
-    # ordered categorical response
     d[outcome] = to_ordered_cat(d[outcome])
 
-    # formula: cumulative ordinal mixed, random intercept
+    # Formula using standardized TimeYears_z
     formula = (
-        f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z "
+        f"{outcome} ~ TimeYears_z + ALPS_baseline_z + TimeYears_z:ALPS_baseline_z "
         f"+ Age_baseline + C(Gender_baseline) + YrsOfEd_baseline + (1|{ID_COL})"
     )
 
@@ -360,7 +336,6 @@ for outcome in ORDINAL_OUTCOMES:
                         "n_rows": n_rows, "n_subjects": n_sub})
         continue
 
-    # posterior summaries
     summ = az.summary(idata, hdi_prob=0.95).reset_index().rename(columns={"index": "term"})
     summ = summ[summ["term"].isin(PRIMARY_TERMS)].copy()
 
@@ -407,7 +382,6 @@ for outcome in ORDINAL_OUTCOMES:
             "status": "OK"
         })
 
-    # paired distribution plot (descriptive)
     try:
         paired_stacked_plot(df, outcome, FIGDIR / f"ORD_DIST_{outcome}.png")
     except Exception:
@@ -418,8 +392,7 @@ res = pd.DataFrame(rows)
 skip_df = pd.DataFrame(skipped)
 
 # -----------------------------
-# OPTIONAL: Managed BH-FDR for ordinal (within Ordinal family per term)
-# Use posterior p-analogue as p-values for multiplicity control (transparent).
+# Managed BH-FDR (Updated to match PRIMARY_TERMS with _z suffix)
 # -----------------------------
 res["q_FDR"] = np.nan
 for term in PRIMARY_TERMS:
