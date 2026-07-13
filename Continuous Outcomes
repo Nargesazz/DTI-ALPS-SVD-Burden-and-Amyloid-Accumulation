@@ -1,15 +1,15 @@
 # ============================================================
-# STRICT BAYESIAN ALPS → SVD / Cognition / Amyloid (HABS-like)
+# STRICT BAYESIAN ALPS -> SVD / Cognition / Amyloid (HABS-like)
 # Sessions: 1 baseline, 4 follow-up (~3y)
 # TimeYears: from NP_SessionDate (years since baseline per Subject)
 # Bayesian Gaussian mixed model:
-#   outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+#   outcome ~ TimeYears_z + ALPS_baseline_z + TimeYears_z:ALPS_baseline_z + covars
 # Random intercept: Subject
 # Missing handling: model-wise complete-case (NO row dropping globally)
 # Outliers: winsorize outcome within each session (pre-specified)
 # Volume normalization: uses *_frac if available; otherwise computes from mm3/ICV_mm3
 # Managed BH-FDR: within families AND within each primary term:
-#   TimeYears, ALPS_baseline_z, TimeYears:ALPS_baseline_z
+#   TimeYears_z, ALPS_baseline_z, TimeYears_z:ALPS_baseline_z
 # Amyloid models additionally adjusted for APOE4 as E4_Status
 # ============================================================
 
@@ -26,7 +26,7 @@ import arviz as az
 # -----------------------------
 # SETTINGS
 # -----------------------------
-FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx" 
+FILE_PATH = r"C:\Users\user\Desktop\HABS\Results90.xlsx"
 
 ID_COL = "Subject"
 SESSION_COL = "Session"
@@ -41,9 +41,7 @@ OUTCOMES = [
     "BG_PVS_frac",
     "WMH_frac",
     "CP_frac",
-    "PACC5",
     "PIB_FS_DVR_FLR",
-    "ProcessingSpeed_proxy_zscore",
 ]
 
 FAMILIES = {
@@ -61,9 +59,9 @@ WINSOR_P_LOW = 0.01
 WINSOR_P_HIGH = 0.99
 
 PRIMARY_TERMS_FOR_FDR = [
-    "TimeYears",
+    "TimeYears_z",
     "ALPS_baseline_z",
-    "TimeYears:ALPS_baseline_z",
+    "TimeYears_z:ALPS_baseline_z",
 ]
 
 OUTDIR = Path(FILE_PATH).parent / "PY_BAYES_STRICT_ALPS_CONTINUOUS"
@@ -258,7 +256,10 @@ fallback_base = df.groupby(ID_COL)[DATE_COL].min()
 base_date = base_date.combine_first(fallback_base)
 
 df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
+
+# Compute raw TimeYears and immediately Z-Score it as TimeYears_z
 df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
+df["TimeYears_z"] = zscore(safe_numeric(df["TimeYears"]))
 
 df = ensure_volume_fractions(df)
 
@@ -342,7 +343,8 @@ for outcome in OUTCOMES:
     cols = [
         ID_COL,
         SESSION_COL,
-        "TimeYears",
+        "TimeYears_z",
+        "TimeYears",  # Keep raw TimeYears for descriptive trajectory plotting
         outcome,
         "ALPS_baseline_z",
         "Age_baseline",
@@ -358,6 +360,7 @@ for outcome in OUTCOMES:
     d = df[cols].copy()
 
     d[outcome] = safe_numeric(d[outcome])
+    d["TimeYears_z"] = safe_numeric(d["TimeYears_z"])
     d["TimeYears"] = safe_numeric(d["TimeYears"])
     d["ALPS_baseline_z"] = safe_numeric(d["ALPS_baseline_z"])
     d["Age_baseline"] = safe_numeric(d["Age_baseline"])
@@ -380,7 +383,7 @@ for outcome in OUTCOMES:
     req_cols = [
         ID_COL,
         "y_winsor",
-        "TimeYears",
+        "TimeYears_z",
         "ALPS_baseline_z",
         "Age_baseline",
         "Gender_baseline",
@@ -415,7 +418,7 @@ for outcome in OUTCOMES:
         continue
 
     dd["y_model"] = (dd["y_winsor"] - y_mean) / y_sd
-    dd["TimeYears_x_ALPS"] = dd["TimeYears"] * dd["ALPS_baseline_z"]
+    dd["TimeYears_z_x_ALPS"] = dd["TimeYears_z"] * dd["ALPS_baseline_z"]
 
     dd[ID_COL] = dd[ID_COL].astype("category")
     subj_idx = dd[ID_COL].cat.codes.values
@@ -425,9 +428,9 @@ for outcome in OUTCOMES:
 
     X = {
         "Intercept": np.ones(len(dd), dtype=float),
-        "TimeYears": dd["TimeYears"].values.astype(float),
+        "TimeYears_z": dd["TimeYears_z"].values.astype(float),
         "ALPS_baseline_z": dd["ALPS_baseline_z"].values.astype(float),
-        "TimeYears:ALPS_baseline_z": dd["TimeYears_x_ALPS"].values.astype(float),
+        "TimeYears_z:ALPS_baseline_z": dd["TimeYears_z_x_ALPS"].values.astype(float),
         "Age_baseline": dd["Age_baseline"].values.astype(float),
         "Gender_baseline": dd["Gender_baseline"].values.astype(float),
         "YrsOfEd_baseline": dd["YrsOfEd_baseline"].values.astype(float),
@@ -517,6 +520,7 @@ for outcome in OUTCOMES:
         continue
 
     try:
+        # Generate plot using raw TimeYears for physical scale plotting
         plot_mean_over_time(
             df_long=dd.rename(columns={"y_winsor": outcome}),
             outcome=outcome,
@@ -566,9 +570,9 @@ if not diag_df.empty:
 if not res.empty:
     forest_plot(
         res,
-        "TimeYears",
-        FIGDIR / "FOREST_TimeYears_HDI.png",
-        "TimeYears main effect, Bayesian 95% HDI, managed BH-FDR within family",
+        "TimeYears_z",
+        FIGDIR / "FOREST_TimeYears_z_HDI.png",
+        "TimeYears_z main effect, Bayesian 95% HDI, managed BH-FDR within family",
     )
 
     forest_plot(
@@ -580,9 +584,9 @@ if not res.empty:
 
     forest_plot(
         res,
-        "TimeYears:ALPS_baseline_z",
-        FIGDIR / "FOREST_TimeYears_x_ALPS_HDI.png",
-        "TimeYears × ALPS interaction, Bayesian 95% HDI, managed BH-FDR within family",
+        "TimeYears_z:ALPS_baseline_z",
+        FIGDIR / "FOREST_TimeYears_z_x_ALPS_HDI.png",
+        "TimeYears_z × ALPS interaction, Bayesian 95% HDI, managed BH-FDR within family",
     )
 
 print("Figures saved to:", str(FIGDIR))
