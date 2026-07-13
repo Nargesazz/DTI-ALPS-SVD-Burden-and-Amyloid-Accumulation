@@ -3,7 +3,7 @@
 # Sessions: 1 baseline, 4 follow-up (~3y)
 # TimeYears: from NP_SessionDate (years since baseline per Subject)
 # Model: Bernoulli mixed model with random intercept for Subject
-# Outcome ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z + covars
+# Outcome ~ TimeYears_z + ALPS_baseline_z + TimeYears_z:ALPS_baseline_z + covars
 # Missing handling: model-wise complete-case (NO global drops)
 # ============================================================
 
@@ -41,7 +41,8 @@ BINARY_OUTCOMES = [
     "BOMBS_Posterior_Fossa"
 ]
 
-PRIMARY_TERMS = ["TimeYears", "ALPS_baseline_z", "TimeYears:ALPS_baseline_z"]
+# Updated primary terms to use standardized TimeYears
+PRIMARY_TERMS = ["TimeYears_z", "ALPS_baseline_z", "TimeYears_z:ALPS_baseline_z"]
 
 DRAWS = 2000
 TUNE = 2000
@@ -155,6 +156,9 @@ df = df.merge(base_date.rename("base_date"), on=ID_COL, how="left")
 df["TimeYears"] = (df[DATE_COL] - df["base_date"]).dt.days / 365.25
 df["TimeYears"] = safe_numeric(df["TimeYears"])
 
+# Calculate TimeYears_z immediately
+df["TimeYears_z"] = zscore(df["TimeYears"])
+
 df = merge_baseline_cov(df, "Age", "Age_baseline")
 df = merge_baseline_cov(df, "Gender", "Gender_baseline")
 df = merge_baseline_cov(df, "YrsOfEd", "YrsOfEd_baseline")
@@ -191,7 +195,8 @@ for outcome in BINARY_OUTCOMES:
         skipped.append({"outcome": outcome, "reason": "missing column"})
         continue
 
-    d = df[[ID_COL, outcome, "TimeYears", "ALPS_baseline_z",
+    # Use TimeYears_z for the model building and filtering
+    d = df[[ID_COL, outcome, "TimeYears_z", "ALPS_baseline_z",
             "Age_baseline", "Gender_baseline", "YrsOfEd_baseline"]].copy()
 
     d[outcome] = safe_numeric(d[outcome])
@@ -222,8 +227,9 @@ for outcome in BINARY_OUTCOMES:
         })
         continue
 
+    # Updated formula using TimeYears_z
     formula = (
-        f"{outcome} ~ TimeYears + ALPS_baseline_z + TimeYears:ALPS_baseline_z "
+        f"{outcome} ~ TimeYears_z + ALPS_baseline_z + TimeYears_z:ALPS_baseline_z "
         f"+ Age_baseline + C(Gender_baseline) + YrsOfEd_baseline + (1|{ID_COL})"
     )
 
