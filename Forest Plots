@@ -8,22 +8,31 @@ import matplotlib.pyplot as plt
 # Paths
 # ---------------------------
 base_path = r"C:\Users\user\Desktop\HABS"
-input_file = os.path.join(base_path, "combined_selected_outcomes_BH_FamilyWise.xlsx")
+# Targets the sorted output file from the merge/sort step
+input_file = os.path.join(base_path, "combined_results_sorted_beta.xlsx")
 save_folder = os.path.join(base_path, "Figs")
 os.makedirs(save_folder, exist_ok=True)
 
 # ---------------------------
-# Terms to plot
+# Terms to plot (Mapped from the Excel terms)
 # ---------------------------
 terms_to_plot = [
     "ALPS_baseline_z",
-    "Time",
-    "Time*ALPS_baseline_z",
+    "Time z",
+    "Time z*ALPS_baseline_z",
 ]
 
 # ---------------------------
 # Helpers
 # ---------------------------
+def clean_title_term(term):
+    """
+    Cleans up the term name for cleaner titles and file naming.
+    E.g., ALPS_baseline_z -> ALPS_baseline, Time z -> Time
+    """
+    term_clean = term.replace("_z", "").replace(" z", "")
+    return term_clean
+
 def safe_name(text):
     text = str(text).strip()
     text = re.sub(r"[^\w\-.]+", "_", text)
@@ -53,7 +62,7 @@ def load_data(path):
     df = pd.read_excel(path)
     df = clean_columns(df)
 
-    print("\nDetected columns:")
+    print("\nDetected columns in file:")
     print(df.columns.tolist())
 
     outcome_col = find_first_existing_column(df, ["outcome"], required=True)
@@ -135,17 +144,18 @@ def forest_plot_single_panel(df, term, interval_label="95% HDI", ref_line=0):
         print(f"No plottable rows for term: {term}")
         return
 
-    # Sort from highest beta to lowest beta
+    # Sort from highest beta to lowest beta (upper to lower)
     d = d.sort_values("beta_std", ascending=False).reset_index(drop=True)
 
     # Only outcome names, no brackets, no family labels
     d["label"] = d["outcome_std"]
 
     y = np.arange(len(d))
-    fig_height = max(6, 0.4 * len(d))
-    fig, ax = plt.subplots(figsize=(12, fig_height))
-
-    sig_mask = d["sig_std"].fillna(False).astype(bool)
+    
+    # Narrower width configuration (6.5 inches)
+    fig_width = 6.5
+    fig_height = max(5, 0.38 * len(d))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     for i, row in d.iterrows():
         is_sig = bool(row["sig_std"]) if pd.notna(row["sig_std"]) else False
@@ -160,8 +170,8 @@ def forest_plot_single_panel(df, term, interval_label="95% HDI", ref_line=0):
             xerr=[[xerr_low], [xerr_high]],
             fmt="none",
             ecolor="black",
-            elinewidth=1.5,
-            capsize=3,
+            elinewidth=1.2,
+            capsize=2.5,
             zorder=2
         )
 
@@ -169,16 +179,19 @@ def forest_plot_single_panel(df, term, interval_label="95% HDI", ref_line=0):
             row["beta_std"],
             i,
             color=point_color,
-            s=36,
+            s=30,
             zorder=3
         )
 
-    ax.axvline(ref_line, linestyle="--", color="gray", linewidth=1)
+    # Clean the term string for title/filename (removing the z-score indicators)
+    cleaned_term = clean_title_term(term)
+
+    ax.axvline(ref_line, linestyle="--", color="gray", linewidth=0.8)
     ax.set_yticks(y)
     ax.set_yticklabels(d["label"])
     ax.invert_yaxis()
     ax.set_xlabel(f"Effect estimate ({interval_label})")
-    ax.set_title(f"Forest plot for {term}")
+    ax.set_title(f"Forest plot for {cleaned_term}")
     ax.grid(axis="x", linestyle=":", alpha=0.5)
 
     xmin = np.nanmin(d["low_std"])
@@ -187,14 +200,7 @@ def forest_plot_single_panel(df, term, interval_label="95% HDI", ref_line=0):
         pad = max((xmax - xmin) * 0.08, 0.02)
         ax.set_xlim(xmin - pad, xmax + pad)
 
-    if sig_mask.any():
-        handles = [
-            plt.Line2D([0], [0], marker="o", color="black", linestyle="", label="Not significant"),
-            plt.Line2D([0], [0], marker="o", color="red", linestyle="", label="Significant"),
-        ]
-        ax.legend(handles=handles, frameon=False, loc="best")
-
-    filename = f"Plot_{safe_name(term)}_ALL.png"
+    filename = f"Plot_{safe_name(cleaned_term)}_ALL.png"
     full_path = os.path.join(save_folder, filename)
 
     plt.tight_layout()
