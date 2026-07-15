@@ -60,7 +60,9 @@ def plot():
     ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.2f"))
     ax.tick_params(colors="#4a5568", labelsize=10)
     ax.set_xlabel("Time (years)", color="#4a5568", fontsize=11)
-    ax.set_ylabel("Predicted Amyloid\n(PIB DVR)", color="#4a5568", fontsize=11)
+    
+    # Updated Y-axis label
+    ax.set_ylabel("Predicted Amyloid Burden\n(PIB_FS_DVR_FLR)", color="#4a5568", fontsize=11)
 
     beta_i = r_i["beta"]
     lo_i = r_i["HDI95_low"]
